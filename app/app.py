@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import threading
@@ -18,7 +19,14 @@ from datetime import datetime, timezone
 from flask import Flask, flash, g, jsonify, redirect, render_template, request, url_for
 
 from bloom import BloomFilter
-from csvio import MAX_ROWS, CsvError, normalize_container, parse_csv
+from csvio import (
+    MAX_ROWS,
+    CsvError,
+    normalize_container,
+    parse_correction_csv,
+    parse_csv,
+    parse_utc_bound,
+)
 from db import connect, init_db
 
 DATABASE = os.environ.get(
@@ -132,6 +140,253 @@ def upload_batch():
         "ok",
     )
     return redirect(url_for("index"))
+
+
+# ---------------------------------------------------------------- 按时段更正
+
+def _bound_iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _row_dt(gate_time_utc: str) -> datetime:
+    """库内归一化时刻（…Z）转回可比较的 UTC datetime。"""
+    return datetime.fromisoformat(gate_time_utc.replace("Z", "+00:00"))
+
+
+def _fetch_segment(db, batch_id: str, start: datetime, end: datetime) -> list[dict]:
+    """在一个读事务快照内取出 [start, end) 的原件行（起点计入、终点不计入）。"""
+    db.execute("BEGIN")
+    try:
+        rows = db.execute(
+            "SELECT line_no, container, gate_time_utc FROM rows"
+            " WHERE batch_id = ? AND batch_version = (SELECT version FROM batches WHERE id = ?)"
+            " ORDER BY gate_time_utc, line_no",
+            (batch_id, batch_id),
+        ).fetchall()
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+    lo, hi = start, end
+    return [
+        dict(r) for r in rows if lo <= _row_dt(r["gate_time_utc"]) < hi
+    ]
+
+
+def _segment_digest(batch_id: str, start_iso: str, end_iso: str,
+                    segment_rows: list[dict]) -> str:
+    """页面所见区间内容的指纹：按 (箱号, UTC时刻) 分组计数，忽略行序。
+
+    指纹同时绑定批号与 UTC 起止时刻；提交时与库中最新区间重算值逐组核对。
+    """
+    groups: dict[tuple[str, str], int] = {}
+    for r in segment_rows:
+        key = (r["container"], r["gate_time_utc"])
+        groups[key] = groups.get(key, 0) + 1
+    h = hashlib.sha256()
+    h.update(f"segment|{batch_id}|{start_iso}|{end_iso}\n".encode("utf-8"))
+    for (container, gate_time), count in sorted(groups.items()):
+        h.update(f"{container}|{gate_time}|{count}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
+@app.get("/segment")
+def segment_dispatch():
+    """首页表单入口：校验批号与 UTC 起止时刻后跳转到规范的时段查看页。"""
+    batch_id = (request.args.get("batch") or "").strip()
+    if not BATCH_RE.fullmatch(batch_id):
+        flash(f"批号非法（允许字母/数字/_/-，1~64 字符）: {batch_id!r}", "error")
+        return redirect(url_for("index"))
+    try:
+        start = parse_utc_bound(request.args.get("start", ""), "起点时刻")
+        end = parse_utc_bound(request.args.get("end", ""), "终点时刻")
+    except CsvError as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    if not start < end:
+        flash("时段非法：起点必须早于终点（起点计入、终点不计入）", "error")
+        return redirect(url_for("index"))
+    return redirect(
+        url_for(
+            "segment_view",
+            batch_id=batch_id,
+            start=_bound_iso(start),
+            end=_bound_iso(end),
+        )
+    )
+
+
+@app.get("/batches/<batch_id>/segment")
+def segment_view(batch_id: str):
+    """查看所选时段 [start, end) 的原件行，并给出提交更正所需的区间指纹。"""
+    try:
+        start = parse_utc_bound(request.args.get("start", ""), "起点时刻")
+        end = parse_utc_bound(request.args.get("end", ""), "终点时刻")
+    except CsvError as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    if not start < end:
+        flash("时段非法：起点必须早于终点（起点计入、终点不计入）", "error")
+        return redirect(url_for("index"))
+    db = get_db()
+    batch = db.execute(
+        "SELECT id, version, row_count FROM batches WHERE id = ?", (batch_id,)
+    ).fetchone()
+    if batch is None:
+        flash(f"批次 {batch_id} 不存在，请先上传", "error")
+        return redirect(url_for("index"))
+    start_iso, end_iso = _bound_iso(start), _bound_iso(end)
+    seg = _fetch_segment(db, batch_id, start, end)
+    digest = _segment_digest(batch_id, start_iso, end_iso, seg)
+    return render_template(
+        "segment.html",
+        batch=dict(batch),
+        start_iso=start_iso,
+        end_iso=end_iso,
+        seg=seg,
+        digest=digest,
+        max_rows=MAX_ROWS,
+        max_upload=MAX_UPLOAD_BYTES,
+    )
+
+
+@app.post("/batches/<batch_id>/correction")
+def correct_segment(batch_id: str):
+    """按时段整段替换：校验 → 区间指纹比对 → 单事务合并升版。
+
+    任何一步失败都在事务外/回滚后返回，流水与索引均不改动。
+    """
+    if not BATCH_RE.fullmatch(batch_id):
+        flash(f"批号非法: {batch_id!r}", "error")
+        return redirect(url_for("index"))
+    try:
+        start = parse_utc_bound(request.form.get("start", ""), "起点时刻")
+        end = parse_utc_bound(request.form.get("end", ""), "终点时刻")
+    except CsvError as e:
+        flash(str(e), "error")
+        return redirect(url_for("index"))
+    if not start < end:
+        flash("时段非法：起点必须早于终点（起点计入、终点不计入）", "error")
+        return redirect(url_for("index"))
+    digest = (request.form.get("digest") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        flash("缺少有效的查看凭证，请先重新查看所选时段再提交", "error")
+        return redirect(url_for("index"))
+    f = request.files.get("file")
+    if f is None:
+        flash("缺少 CSV 文件", "error")
+        return redirect(url_for("index"))
+    data = f.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        flash(f"更正被拒绝：文件超过 {MAX_UPLOAD_BYTES} 字节", "error")
+        return redirect(url_for("index"))
+    try:
+        new_rows, header_seen = parse_correction_csv(data)  # 先整体校验
+    except CsvError as e:
+        flash(f"批次 {batch_id} 更正被拒绝：{e}", "error")
+        return redirect(url_for("index"))
+
+    start_iso, end_iso = _bound_iso(start), _bound_iso(end)
+    # 越界行整份拒收（起点计入、终点不计入）
+    for lineno, _container, gate_time in new_rows:
+        ts = _row_dt(gate_time)
+        if not (start <= ts < end):
+            flash(
+                f"批次 {batch_id} 更正被拒绝：第 {lineno} 行时刻 {gate_time}"
+                f" 越出所选时段 [{start_iso}, {end_iso})，整份拒收",
+                "error",
+            )
+            return redirect(url_for("index"))
+
+    db = get_db()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        batch = db.execute(
+            "SELECT version, row_count FROM batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        if batch is None:
+            db.execute("ROLLBACK")
+            flash(f"批次 {batch_id} 不存在，请先上传", "error")
+            return redirect(url_for("index"))
+        old_version = batch["version"]
+        current = db.execute(
+            "SELECT line_no, container, gate_time_utc FROM rows"
+            " WHERE batch_id = ? AND batch_version = ? ORDER BY line_no",
+            (batch_id, old_version),
+        ).fetchall()
+        lo, hi = start, end
+        inside = [dict(r) for r in current if lo <= _row_dt(r["gate_time_utc"]) < hi]
+        outside = [dict(r) for r in current if not (lo <= _row_dt(r["gate_time_utc"]) < hi)]
+
+        # 提交时比较页面所见与库中最新区间内容（按箱号+UTC时刻逐组核对条数，忽略行序）
+        latest_digest = _segment_digest(batch_id, start_iso, end_iso, inside)
+        if latest_digest != digest:
+            db.execute("ROLLBACK")
+            flash(
+                "所选时段在您查看后已发生变化，为避免覆盖他人更正，请重新查看该时段后再提交",
+                "error",
+            )
+            return redirect(
+                url_for(
+                    "segment_view", batch_id=batch_id, start=start_iso, end=end_iso
+                )
+            )
+
+        merged = outside + [
+            {"container": c, "gate_time_utc": t} for _ln, c, t in new_rows
+        ]
+        if len(merged) > MAX_ROWS:
+            db.execute("ROLLBACK")
+            flash(
+                f"批次 {batch_id} 更正被拒绝：合并后共 {len(merged)} 行"
+                f"（区间外保留 {len(outside)} 行 + 替换 {len(new_rows)} 行），"
+                f"超过单批上限 {MAX_ROWS} 行；流水未改动",
+                "error",
+            )
+            return redirect(url_for("index"))
+
+        new_version = old_version + 1
+        db.execute(
+            "UPDATE batches SET version = ?, row_count = ?, uploaded_at = ?,"
+            " filter_version = NULL, filter_status = 'none',"
+            " building_version = NULL, filter_error = NULL WHERE id = ?",
+            (new_version, len(merged), utcnow(), batch_id),
+        )
+        db.execute("DELETE FROM rows WHERE batch_id = ?", (batch_id,))
+        db.executemany(
+            "INSERT INTO rows (batch_id, batch_version, line_no, container, gate_time_utc)"
+            " VALUES (?, ?, ?, ?, ?)",
+            [
+                (batch_id, new_version, i, r["container"], r["gate_time_utc"])
+                for i, r in enumerate(merged, start=1)
+            ],
+        )
+        # 旧布隆过滤器随升版同时失效（若有旧构建在途，其条件提交会被拒绝）
+        db.execute(
+            "DELETE FROM filters WHERE batch_id = ? AND version <> ?",
+            (batch_id, new_version),
+        )
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+    if not new_rows and header_seen:
+        flash(
+            f"批次 {batch_id} 时段 [{start_iso}, {end_iso}) 已清空：升版 v{new_version}，"
+            f"现共 {len(merged)} 行（区间外流水保留，旧过滤器已失效）",
+            "ok",
+        )
+    else:
+        flash(
+            f"批次 {batch_id} 时段更正成功：v{old_version} → v{new_version}，"
+            f"替换 {len(inside)} 行为 {len(new_rows)} 行，区间外保留 {len(outside)} 行，"
+            f"现共 {len(merged)} 行（旧过滤器已失效）",
+            "ok",
+        )
+    return redirect(
+        url_for("segment_view", batch_id=batch_id, start=start_iso, end=end_iso)
+    )
 
 
 @app.post("/batches/<batch_id>/filter")

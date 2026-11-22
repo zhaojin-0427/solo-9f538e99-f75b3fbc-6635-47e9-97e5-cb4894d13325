@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>时段更正 {{ batch.id }}</title>
+<style>
+  body{font-family:system-ui,"Microsoft YaHei",sans-serif;margin:2rem auto;max-width:980px;padding:0 1rem;color:#222}
+  h1{font-size:1.4rem} h2{font-size:1.1rem;margin-top:1.6rem}
+  table{border-collapse:collapse;width:100%;margin-top:.5rem}
+  th,td{border:1px solid #ccc;padding:.35rem .6rem;text-align:left;font-size:.9rem}
+  th{background:#f0f0f0}
+  .msg-ok{background:#e6f6e6;border:1px solid #8c8;padding:.4rem .8rem;margin:.3rem 0}
+  .msg-err{background:#fde8e8;border:1px solid #c88;padding:.4rem .8rem;margin:.3rem 0}
+  .muted{color:#666;font-size:.85rem}
+  code{background:#f4f4f4;padding:.1rem .3rem}
+  fieldset{border:1px solid #ccc;padding:.8rem;margin-bottom:1rem}
+</style>
+</head>
+<body>
+<h1>按时段更正：批次 {{ batch.id }}（当前 v{{ batch.version }}，全批 {{ batch.row_count }} 行）</h1>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, m in messages %}
+    <div class="{{ 'msg-ok' if cat == 'ok' else 'msg-err' }}">{{ m }}</div>
+  {% endfor %}
+{% endwith %}
+
+<p>所选时段（左闭右开，起点计入、终点不计入）：<code>{{ start_iso }}</code> ≤ t &lt; <code>{{ end_iso }}</code></p>
+
+<h2>该时段当前记录（{{ seg|length }} 行，即提交时核对的“页面所见”）</h2>
+<table>
+<tr><th>行号</th><th>箱号</th><th>UTC 过闸时刻</th></tr>
+{% for r in seg %}
+<tr><td>{{ r.line_no }}</td><td>{{ r.container }}</td><td>{{ r.gate_time_utc }}</td></tr>
+{% else %}
+<tr><td colspan="3" class="muted">该时段暂无记录（上传只有表头的 CSV 即保持清空）</td></tr>
+{% endfor %}
+</table>
+
+<fieldset><legend>上传同格式 CSV 整段替换（两列：箱号,UTC过闸时刻；≤ {{ max_rows }} 行；文件 ≤ {{ max_upload }} 字节）</legend>
+<form method="post" action="{{ url_for('correct_segment', batch_id=batch.id) }}" enctype="multipart/form-data">
+  <input type="hidden" name="start" value="{{ start_iso }}">
+  <input type="hidden" name="end" value="{{ end_iso }}">
+  <input type="hidden" name="digest" value="{{ digest }}">
+  <input type="file" name="file" accept=".csv" required>
+  <button type="submit">提交时段更正</button>
+</form>
+<p class="muted">
+  规则：替换行的时刻必须全部落在 <code>[{{ start_iso }}, {{ end_iso }})</code> 内，含越界行则整份拒收；
+  只有表头的 CSV 表示清空该时段；区间外的最新流水原样保留，合并后全批仍限 {{ max_rows }} 行。
+  提交瞬间会按箱号 + UTC 时刻逐组比对条数（忽略行序）：若该时段已被别人改动，将要求您重新查看后再提交。
+  更正成功后批次升版、旧布隆过滤器同时失效，查箱随即读到合并结果；失败的提交不改动任何流水或索引。
+</p>
+</fieldset>
+
+<p>
+  <a href="{{ url_for('segment_view', batch_id=batch.id, start=start_iso, end=end_iso) }}">重新查看该时段</a>
+  ｜ <a href="{{ url_for('index') }}">返回首页</a>
+</p>
+</body>
+</html>

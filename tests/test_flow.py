@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -70,6 +71,10 @@ def wait_for(pred, timeout=10.0, what=""):
             return True
         time.sleep(0.05)
     raise AssertionError(f"超时等待: {what}")
+
+
+def url_contains(resp, fragment):
+    return fragment in resp.headers.get("Location", "")
 
 
 def wait_build_done(batch):
@@ -269,6 +274,218 @@ check("交错压力下无内部异常", not errors, "; ".join(errors[:3]))
 check("60 次查询均满足快照一致性（命中⊆已扫描、版本一致、批次不重复）", consistent)
 info = batch_info("B9")
 check("压力后 B9 状态收敛（非 building）", info["filter_status"] != "building", str(info))
+
+# ---------------------------------------------------------------- 9. 按时段更正（相交/不相交时段交错提交）
+def iso(hour, minute=0):
+    return f"2026-11-22T{hour:02d}:{minute:02d}:00Z"
+
+
+def seg_page(batch, start, end):
+    return client.get(f"/batches/{batch}/segment?start={start}&end={end}",
+                      follow_redirects=True)
+
+
+def seg_dispatch(batch, start, end):
+    return client.get("/segment", query_string={"batch": batch, "start": start, "end": end},
+                      follow_redirects=False)
+
+
+def seg_digest(batch, start, end):
+    r = seg_page(batch, start, end)
+    m = re.search(r'name="digest" value="([0-9a-f]{64})"', r.get_data(as_text=True))
+    assert m, r.get_data(as_text=True)[:300]
+    return m.group(1)
+
+
+def correct(batch, start, end, digest, pairs=None, header=None, raw=None):
+    data = raw if raw is not None else csv_bytes(pairs or [], header)
+    return client.post(
+        f"/batches/{batch}/correction",
+        data={"start": start, "end": end, "digest": digest,
+              "file": (io.BytesIO(data), "f.csv")},
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+
+def db_rows(batch):
+    conn = sqlite3.connect(os.environ["DATABASE_PATH"])
+    try:
+        return conn.execute(
+            "SELECT container, gate_time_utc FROM rows"
+            " WHERE batch_id=? AND batch_version=(SELECT version FROM batches WHERE id=?)"
+            " ORDER BY gate_time_utc, line_no", (batch, batch)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+# 9.0 准备批次 R1：8 行，时刻 01:00..08:00
+base = [(f"R{i}", iso(i)) for i in range(1, 9)]
+upload("R1", base)
+check("时段更正基线：R1 v1 共 8 行", batch_info("R1")["version"] == 1 and batch_info("R1")["row_count"] == 8)
+
+# 9.1 查看页与首页入口
+r = seg_page("R1", iso(2), iso(5))
+txt = r.get_data(as_text=True)
+table = txt.split("<h2>该时段当前记录", 1)[1].split("</table>", 1)[0]
+check("查看页表格列出区间内 3 行（02/03/04 点，左闭右开）",
+      all(x in table for x in ("R2", "R3", "R4")) and "R5" not in table
+      and "R1</td>" not in table and iso(5) not in table)
+r = seg_dispatch("R1", iso(2), iso(5))
+check("首页 /segment 入口 302 到规范查看页", r.status_code == 302 and "/batches/R1/segment" in r.headers["Location"])
+r = seg_dispatch("R1", iso(5), iso(2))
+check("起点≥终点被拒绝（重定向回首页）", r.status_code == 302 and url_contains(r, "/"))
+r = seg_dispatch("R1", "2026-11-22T02:00:00", iso(5))  # 无时区
+check("边界时刻缺时区标识被拒绝", r.status_code == 302)
+r = seg_dispatch("R1", "2026-11-22T02:00:00+08:00", iso(5))  # 非 UTC 时区
+check("非 UTC 时区边界被拒绝", r.status_code == 302)
+r = client.get("/batches/R1/segment",
+               query_string={"start": "2026-11-22T02:00:00+00:00",
+                             "end": "2026-11-22T05:00:00+00:00"})
+check("+00:00 形式的 UTC 边界可正常查看", r.status_code == 200 and "该时段当前记录" in r.get_data(as_text=True))
+r = seg_page("NOPE", iso(0), iso(9))
+check("不存在批次的查看页回到首页并报错", r.status_code == 200 and "不存在" in r.get_data(as_text=True))
+d0 = seg_digest("R1", iso(2), iso(5))
+check("区间指纹为 64 位十六进制", re.fullmatch(r"[0-9a-f]{64}", d0) is not None)
+
+# 9.2 越界行整份拒收，失败不改动流水/版本
+before = db_rows("R1")
+r = correct("R1", iso(2), iso(5), d0, [("R2", iso(2)), ("R9", iso(5))])  # 05:00 == 终点，越界
+check("终点时刻行判越界、整份拒收", "越出所选时段" in r.get_data(as_text=True))
+r = correct("R1", iso(2), iso(5), d0, [("R2", iso(1)), ("R3", iso(3))])  # 01:00 < 起点，越界
+check("起点之前行判越界、整份拒收", "越出所选时段" in r.get_data(as_text=True))
+check("拒收后流水与版本均未改动", db_rows("R1") == before and batch_info("R1")["version"] == 1)
+
+# 9.3 合法相交时段更正：替换 [02,05)，区间外保留
+r = correct("R1", iso(2), iso(5), d0, [("N2", iso(2)), ("N3", iso(3, 30)), ("N4", iso(4))])
+check("相交时段更正成功并升版 v2", "时段更正成功" in r.get_data(as_text=True) and batch_info("R1")["version"] == 2)
+expect = [("R1", iso(1)), ("N2", iso(2)), ("N3", iso(3, 30)), ("N4", iso(4)),
+          ("R5", iso(5)), ("R6", iso(6)), ("R7", iso(7)), ("R8", iso(8))]
+check("合并结果 = 区间外最新流水 + 替换行（共 8 行）", db_rows("R1") == expect, str(db_rows("R1")))
+check("升版后旧布隆过滤器失效", batch_info("R1")["filter_status"] == "none" and batch_info("R1")["filter_version"] is None)
+q = query("R3")
+check("查箱读到合并结果：旧行 R3 已消失", q["matches"] == [])
+q = query("N3")
+check("查箱读到合并结果：新行 N3 命中 v2",
+      [(m["batch"], m["version"], m["gate_time_utc"]) for m in q["matches"]] == [("R1", 2, iso(3, 30))])
+
+# 9.4 陈旧指纹：时段已被改动，提交被要求重新查看
+r = correct("R1", iso(2), iso(5), d0, [("X2", iso(2))])
+check("页面所见已过期 → 拒绝并提示重新查看", "已发生变化" in r.get_data(as_text=True) and "重新查看" in r.get_data(as_text=True))
+check("过期提交不改动流水", db_rows("R1") == expect and batch_info("R1")["version"] == 2)
+
+# 9.5 不相交时段交错提交：对一个始终未被触碰的时段，跨多轮不相交升版旧凭证仍有效；
+#     一旦该时段内容真的变化，旧凭证立即失效
+d2 = seg_digest("R1", iso(5), iso(7))  # [05,07) = R5,R6（本小节全程不直接改它）
+r = correct("R1", iso(7), iso(9), seg_digest("R1", iso(7), iso(9)),
+            [("N7", iso(7)), ("N8", iso(8))])  # 不相交时段 [07,09) 先改 → v3
+check("不相交时段更正成功 v3", batch_info("R1")["version"] == 3)
+r = correct("R1", iso(1), iso(2), seg_digest("R1", iso(1), iso(2)), [("M1", iso(1))])  # → v4
+check("第二轮不相交更正成功 v4", batch_info("R1")["version"] == 4)
+r = correct("R1", iso(2), iso(5), seg_digest("R1", iso(2), iso(5)),
+            [("N2", iso(2)), ("N3", iso(3, 30)), ("N4", iso(4))])  # 仍不相交 → v5
+check("第三轮不相交更正成功 v5", batch_info("R1")["version"] == 5)
+r = correct("R1", iso(5), iso(7), d2, [("N5", iso(5)), ("N6", iso(6))])
+check("时段内容始终未变 → 多轮升版后旧凭证依旧有效（v6）",
+      "时段更正成功" in r.get_data(as_text=True) and batch_info("R1")["version"] == 6)
+# 直接篡改库内容模拟“时段已变”，同一份旧凭证必须被拒
+conn = sqlite3.connect(os.environ["DATABASE_PATH"])
+try:
+    conn.execute("UPDATE rows SET container='TAMPERED' WHERE container='N5'")
+    conn.commit()
+finally:
+    conn.close()
+r = correct("R1", iso(5), iso(7), d2, [("N5", iso(5))])
+check("所选时段已变 → 拒绝并提示重新查看", "已发生变化" in r.get_data(as_text=True))
+check("被拒后篡改内容保留、版本不动", batch_info("R1")["version"] == 6 and
+      any(c == "TAMPERED" for c, _t in db_rows("R1")))
+d3 = seg_digest("R1", iso(5), iso(7))  # 重新查看拿到新凭证
+r = correct("R1", iso(5), iso(7), d3, [("N5", iso(5)), ("N6", iso(6))])
+check("重新查看后提交成功（v7），区间外流水保留",
+      "时段更正成功" in r.get_data(as_text=True) and batch_info("R1")["version"] == 7)
+expect = [("M1", iso(1)), ("N2", iso(2)), ("N3", iso(3, 30)), ("N4", iso(4)),
+          ("N5", iso(5)), ("N6", iso(6)), ("N7", iso(7)), ("N8", iso(8))]
+check("多轮交错更正后的完整合并结果正确", db_rows("R1") == expect, str(db_rows("R1")))
+
+# 9.6 同组多条重复行按条数核对（忽略行序）：两行同箱号同时刻
+d4 = seg_digest("R1", iso(2), iso(3))
+r = correct("R1", iso(2), iso(3), d4, [("DUP", iso(2, 30)), ("DUP", iso(2, 30))])
+check("重复 (箱号,时刻) 组按两条接受", batch_info("R1")["version"] == 8)
+q = query("DUP")
+check("重复行均可查到（2 条）", len(q["matches"]) == 2 and all(m["version"] == 8 for m in q["matches"]))
+d5 = seg_digest("R1", iso(2), iso(3))
+r = correct("R1", iso(2), iso(3), d5, [("DUP", iso(2, 30))])  # 2 条 → 1 条
+check("同组条数变化能被指纹识别并接受新内容", batch_info("R1")["version"] == 9)
+q = query("DUP")
+check("该组现在只剩 1 条", len(q["matches"]) == 1)
+
+# 9.7 只有表头的 CSV 清空所选时段；空文件仍拒绝
+d6 = seg_digest("R1", iso(5), iso(7))  # N5,N6
+r = correct("R1", iso(5), iso(7), d6, header="箱号,UTC过闸时刻")
+check("只有表头的 CSV 清空时段并升版", "已清空" in r.get_data(as_text=True) and batch_info("R1")["version"] == 10)
+rows_now = db_rows("R1")
+check("清空后该时段无记录、区间外保留（8-2=6 行）",
+      [t for _c, t in rows_now].count(iso(5)) == 0 and [t for _c, t in rows_now].count(iso(6)) == 0
+      and ("M1", iso(1)) in rows_now and ("N8", iso(8)) in rows_now and len(rows_now) == 6)
+r = correct("R1", iso(5), iso(7), seg_digest("R1", iso(5), iso(7)), raw=b"\n\n\n")
+check("仅空行的更正文件被拒绝", "至少要包含表头" in r.get_data(as_text=True))
+check("拒绝清空操作不改动版本", batch_info("R1")["version"] == 10)
+# 9.8 合并后 5000 行上限：清空大区间后再尝试超限合并
+big_batch = "R2"
+upload(big_batch, [(f"P{i:05d}", iso(1)) for i in range(1, 5001)])  # 5000 行同一时刻
+dg = seg_digest(big_batch, iso(0), iso(2))
+r = correct(big_batch, iso(0), iso(2), dg,
+            [(f"P{i:05d}", iso(1)) for i in range(1, 5000)] + [("Q1", iso(1))])  # 5000 替换 → 合并 5000
+check("合并后恰 5000 行接受", batch_info(big_batch)["version"] == 2 and batch_info(big_batch)["row_count"] == 5000)
+dg = seg_digest(big_batch, iso(3), iso(4))  # 空区间
+r = correct(big_batch, iso(3), iso(4), dg, [("Q2", iso(3))])  # 5000 + 1 = 5001
+check("合并后 5001 行整份拒绝且流水不动",
+      "超过单批上限" in r.get_data(as_text=True) and batch_info(big_batch)["row_count"] == 5000
+      and batch_info(big_batch)["version"] == 2)
+q = query("Q2")
+check("超限拒绝后查不到新行", q["matches"] == [])
+# 先清空一个含 1 行的时段腾出名额，再补 1 行 → 恰好 5000
+dg = seg_digest(big_batch, iso(0), iso(2))
+r = correct(big_batch, iso(0), iso(2), dg,
+            [(f"P{i:05d}", iso(1)) for i in range(1, 5000)])  # 4999 行
+check("先清空 1 行名额（4999+0=4999）", batch_info(big_batch)["row_count"] == 4999)
+dg = seg_digest(big_batch, iso(3), iso(4))
+r = correct(big_batch, iso(3), iso(4), dg, [("Q2", iso(3))])
+check("腾出名额后补行成功，回到 5000 行", batch_info(big_batch)["row_count"] == 5000)
+q = query("Q2")
+check("新行可查、版本正确", [(m["batch"], m["version"]) for m in q["matches"]] == [(big_batch, 4)])
+
+# 9.9 更正后重建过滤器，查箱立即走新索引
+build("R1")
+wait_build_done("R1")
+check("更正后可重建同版过滤器", batch_info("R1")["filter_status"] == "ready"
+      and batch_info("R1")["filter_version"] == batch_info("R1")["version"])
+q = query("ZZZ9999")
+check("新过滤器可跳过不可能命中的批次", any(s["batch"] == "R1" for s in q["skipped"]))
+q = query("N8")
+check("经合并保留的行仍能命中", len(q["matches"]) == 1 and q["matches"][0]["batch"] == "R1")
+
+# 9.10 更正与整批上传交错：整批上传后旧更正凭证失效
+d7 = seg_digest("R1", iso(1), iso(2))
+v_before = batch_info("R1")["version"]
+upload("R1", [("W1", iso(1)), ("W2", iso(2))])  # 整份替换 → 版本跳跃
+check("整批上传后版本 +1", batch_info("R1")["version"] == v_before + 1)
+r = correct("R1", iso(1), iso(2), d7, [("W9", iso(1))])
+check("整批上传后旧时段凭证被拒", "已发生变化" in r.get_data(as_text=True))
+check("被拒后整批上传的内容不动", db_rows("R1") == [("W1", iso(1)), ("W2", iso(2))])
+d8 = seg_digest("R1", iso(1), iso(2))
+r = correct("R1", iso(1), iso(2), d8, [("W9", iso(1, 30))])
+check("重新查看后可在整批替换的新版本上继续时段更正",
+      db_rows("R1") == [("W9", iso(1, 30)), ("W2", iso(2))])
+
+# 9.11 凭证缺失/伪造被拒
+r = correct("R1", iso(1), iso(2), "deadbeef", [("W0", iso(1))])
+check("非法指纹凭证被拒", "查看凭证" in r.get_data(as_text=True))
+r = client.post("/batches/R1/correction",
+                data={"start": iso(1), "end": iso(2), "digest": seg_digest("R1", iso(1), iso(2))},
+                follow_redirects=True)  # 不带文件
+check("缺少 CSV 文件被拒", "缺少 CSV" in r.get_data(as_text=True))
 
 # ---------------------------------------------------------------- 汇总
 failed = [n for n, ok in CHECKS if not ok]

@@ -40,6 +40,26 @@
 </form>
 </fieldset>
 
+<fieldset><legend>按时段更正（只重导出错时段：先查看该段记录，再上传同格式 CSV 整段替换）</legend>
+<form method="get" action="{{ url_for('segment_dispatch') }}">
+  批号
+  <select name="batch" required>
+    <option value="" disabled selected>选择现有批号…</option>
+    {% for b in batches %}<option value="{{ b.id }}">{{ b.id }}（v{{ b.version }}，{{ b.row_count }} 行）</option>{% endfor %}
+  </select>
+  UTC 起点（计入）
+  <input name="start" required placeholder="2026-11-22T00:00:00Z" pattern=".*Z$|.*\+00:00$">
+  UTC 终点（不计入）
+  <input name="end" required placeholder="2026-11-22T12:00:00Z" pattern=".*Z$|.*\+00:00$">
+  <button type="submit">查看该时段</button>
+</form>
+<p class="muted">
+  区间为左闭右开 [起点, 终点)；时刻须为 UTC（Z 或 +00:00）。
+  查看页可下载/核对该段记录并上传替换 CSV：含越界行整份拒收；只有表头的 CSV 可清空该时段；
+  合并后仍限 {{ max_rows }} 行。提交时会复核区间是否仍是您查看时的内容，已变化则要求重新查看。
+</p>
+</fieldset>
+
 <h2>批次列表</h2>
 <table>
 <tr><th>批号</th><th>版本</th><th>行数</th><th>上传时间(UTC)</th><th>布隆过滤器（≤ {{ max_filter }} B）</th><th>操作</th></tr>
