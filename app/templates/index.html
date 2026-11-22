@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>集装箱过闸记录查询</title>
+<style>
+  body{font-family:system-ui,"Microsoft YaHei",sans-serif;margin:2rem auto;max-width:980px;padding:0 1rem;color:#222}
+  h1{font-size:1.4rem} h2{font-size:1.1rem;margin-top:2rem}
+  table{border-collapse:collapse;width:100%;margin-top:.5rem}
+  th,td{border:1px solid #ccc;padding:.35rem .6rem;text-align:left;font-size:.9rem}
+  th{background:#f0f0f0}
+  .msg-ok{background:#e6f6e6;border:1px solid #8c8;padding:.4rem .8rem;margin:.3rem 0}
+  .msg-err{background:#fde8e8;border:1px solid #c88;padding:.4rem .8rem;margin:.3rem 0}
+  form.inline{display:inline}
+  fieldset{border:1px solid #ccc;padding:.8rem;margin-bottom:1rem}
+  .muted{color:#666;font-size:.85rem}
+</style>
+</head>
+<body>
+<h1>集装箱过闸记录查询（港区）</h1>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, m in messages %}
+    <div class="{{ 'msg-ok' if cat == 'ok' else 'msg-err' }}">{{ m }}</div>
+  {% endfor %}
+{% endwith %}
+
+<fieldset><legend>按箱号查询</legend>
+<form method="get" action="{{ url_for('query') }}">
+  箱号 <input name="container" required maxlength="64" placeholder="如 CSQU3054383">
+  <button type="submit">查询</button>
+</form>
+</fieldset>
+
+<fieldset><legend>上传 / 更正批次（同批号即整份替换；CSV 两列：箱号,UTC过闸时刻，≤ {{ max_rows }} 行）</legend>
+<form method="post" action="{{ url_for('upload_batch') }}" enctype="multipart/form-data">
+  批号 <input name="batch" required pattern="[A-Za-z0-9_\-]{1,64}" placeholder="如 LOT-20261122-A">
+  <input type="file" name="file" accept=".csv" required>
+  <button type="submit">上传</button>
+</form>
+</fieldset>
+
+<h2>批次列表</h2>
+<table>
+<tr><th>批号</th><th>版本</th><th>行数</th><th>上传时间(UTC)</th><th>布隆过滤器（≤ {{ max_filter }} B）</th><th>操作</th></tr>
+{% for b in batches %}
+<tr>
+  <td>{{ b.id }}</td>
+  <td>v{{ b.version }}</td>
+  <td>{{ b.row_count }}</td>
+  <td>{{ b.uploaded_at }}</td>
+  <td>
+    {% if b.filter_status == 'ready' %}
+      就绪（v{{ b.filter_version }}，{{ b.nbytes }} B，k={{ b.k_hashes }}，{{ b.items }} 项）
+    {% elif b.filter_status == 'building' %}
+      构建中（v{{ b.building_version }}）…
+    {% elif b.filter_status == 'failed' %}
+      构建失败：{{ b.filter_error or '未知错误' }}（查询不受影响）
+    {% else %}
+      未构建
+    {% endif %}
+  </td>
+  <td>
+    {% if b.filter_status != 'building' %}
+    <form class="inline" method="post" action="{{ url_for('build_filter', batch_id=b.id) }}">
+      <button type="submit">建立布隆过滤器</button>
+    </form>
+    {% else %}<span class="muted">请稍候…</span>{% endif %}
+  </td>
+</tr>
+{% else %}
+<tr><td colspan="6" class="muted">暂无批次</td></tr>
+{% endfor %}
+</table>
+<p class="muted">
+说明：同版布隆过滤器判定箱号不存在时跳过该批原件，否则逐行核对原件；
+更正批次后旧过滤器自动失效；构建失败不影响查询。
+</p>
+</body>
+</html>

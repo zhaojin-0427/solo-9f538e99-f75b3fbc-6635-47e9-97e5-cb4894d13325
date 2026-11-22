@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>查询 {{ r.container }}</title>
+<style>
+  body{font-family:system-ui,"Microsoft YaHei",sans-serif;margin:2rem auto;max-width:980px;padding:0 1rem;color:#222}
+  h1{font-size:1.4rem} h2{font-size:1.1rem;margin-top:1.6rem}
+  table{border-collapse:collapse;width:100%;margin-top:.5rem}
+  th,td{border:1px solid #ccc;padding:.35rem .6rem;text-align:left;font-size:.9rem}
+  th{background:#f0f0f0}
+  .muted{color:#666;font-size:.85rem}
+</style>
+</head>
+<body>
+<h1>箱号 {{ r.container }} 的过闸记录</h1>
+<p>命中 {{ r.matches|length }} 行；实际扫描 {{ r.scanned|length }} 个批次，同版过滤器跳过 {{ r.skipped|length }} 个批次。</p>
+
+<h2>命中行</h2>
+<table>
+<tr><th>批号</th><th>版本</th><th>行号</th><th>过闸时刻(UTC)</th></tr>
+{% for m in r.matches %}
+<tr><td>{{ m.batch }}</td><td>v{{ m.version }}</td><td>{{ m.line_no }}</td><td>{{ m.gate_time_utc }}</td></tr>
+{% else %}
+<tr><td colspan="4" class="muted">无命中</td></tr>
+{% endfor %}
+</table>
+
+<h2>实际扫描过的批次（逐行核对原件）</h2>
+<ul>
+{% for s in r.scanned %}
+  <li>{{ s.batch }}（v{{ s.version }}，{{ s.rows_scanned }} 行）</li>
+{% else %}
+  <li class="muted">无</li>
+{% endfor %}
+</ul>
+
+<h2>被同版布隆过滤器跳过的批次</h2>
+<ul>
+{% for s in r.skipped %}
+  <li>{{ s.batch }}（v{{ s.version }}）</li>
+{% else %}
+  <li class="muted">无</li>
+{% endfor %}
+</ul>
+
+<p><a href="{{ url_for('index') }}">返回批次列表</a></p>
+</body>
+</html>

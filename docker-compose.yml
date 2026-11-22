@@ -1,0 +1,23 @@
+services:
+  gate-web:
+    build: ./app
+    image: gate-query:latest
+    container_name: gate-query
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/gate.db
+      # 生产部署请改用随机长串
+      SECRET_KEY: ${SECRET_KEY:-dev-only-secret-change-me}
+    volumes:
+      - gate-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  gate-data:
